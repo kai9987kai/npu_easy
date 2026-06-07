@@ -43,6 +43,52 @@ def _load_onnxruntime() -> Any:
     return importlib.import_module("onnxruntime")
 
 
+def _device_type_name(ep_device: Any) -> str:
+    device_type = getattr(getattr(ep_device, "device", None), "type", None)
+    return getattr(device_type, "name", str(device_type).rsplit(".", 1)[-1]).upper()
+
+
+def _register_qnn_plugin(ort: Any) -> Any | None:
+    """Register the standalone QNN 2.x plugin when it is installed."""
+
+    if not all(
+        hasattr(ort, attribute)
+        for attribute in (
+            "get_ep_devices",
+            "register_execution_provider_library",
+        )
+    ):
+        return None
+
+    try:
+        qnn = importlib.import_module("onnxruntime_qnn")
+    except (ImportError, OSError):
+        return None
+
+    try:
+        registered = any(
+            device.ep_name == "QNNExecutionProvider"
+            for device in ort.get_ep_devices()
+        )
+        if not registered:
+            ort.register_execution_provider_library(
+                "QNNExecutionProvider",
+                qnn.get_library_path(),
+            )
+    except Exception as exc:
+        if "already registered" not in str(exc).lower():
+            return None
+    return qnn
+
+
+def _get_available_provider_names(ort: Any) -> list[str]:
+    providers = list(ort.get_available_providers())
+    _register_qnn_plugin(ort)
+    if hasattr(ort, "get_ep_devices"):
+        providers.extend(device.ep_name for device in ort.get_ep_devices())
+    return _deduplicate(providers)
+
+
 def _deduplicate(values: Sequence[str]) -> list[str]:
     return list(dict.fromkeys(value for value in values if value))
 
@@ -147,7 +193,9 @@ def get_available_provider_configs(
 
     if available_providers is None:
         try:
-            available_providers = _load_onnxruntime().get_available_providers()
+            available_providers = _get_available_provider_names(
+                _load_onnxruntime()
+            )
         except (ImportError, OSError):
             available_providers = ()
 
@@ -174,6 +222,25 @@ def get_available_provider_configs(
     for provider in GPU_PROVIDER_PRIORITY:
         if provider in available:
             configs.append(ProviderConfig(provider, "GPU"))
+    if "QNNExecutionProvider" in available:
+        try:
+            ort = _load_onnxruntime()
+            _register_qnn_plugin(ort)
+            has_qnn_gpu = any(
+                device.ep_name == "QNNExecutionProvider"
+                and _device_type_name(device) == "GPU"
+                for device in ort.get_ep_devices()
+            )
+        except (AttributeError, ImportError, OSError):
+            has_qnn_gpu = False
+        if has_qnn_gpu:
+            configs.append(
+                ProviderConfig(
+                    "QNNExecutionProvider",
+                    "GPU",
+                    {"backend_type": "gpu"},
+                )
+            )
     if "OpenVINOExecutionProvider" in available:
         configs.append(
             ProviderConfig(
@@ -229,8 +296,22 @@ def get_provider_config(
 ) -> ProviderConfig:
     """Build a provider config, applying sensible NPU defaults."""
 
+    requested_device: str | None = None
+    if provider == "QNNExecutionProvider" and options:
+        backend_type = str(options.get("backend_type", "")).lower()
+        backend_path = str(options.get("backend_path", "")).lower()
+        if backend_type == "gpu" or "qnngpu" in backend_path:
+            requested_device = "GPU"
+        elif backend_type == "cpu" or "qnncpu" in backend_path:
+            requested_device = "CPU"
+        elif backend_type == "htp" or "qnnhtp" in backend_path:
+            requested_device = "NPU"
+
     for config in get_available_provider_configs():
-        if config.name == provider:
+        if (
+            config.name == provider
+            and (requested_device is None or config.device == requested_device)
+        ):
             return ProviderConfig(
                 config.name,
                 config.device,
@@ -261,7 +342,7 @@ def get_diagnostics() -> dict[str, Any]:
     hardware = check_hardware()
     try:
         ort = _load_onnxruntime()
-        available = list(ort.get_available_providers())
+        available = _get_available_provider_names(ort)
         ort_info = {
             "installed": True,
             "version": getattr(ort, "__version__", "unknown"),

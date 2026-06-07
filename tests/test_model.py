@@ -118,3 +118,49 @@ def test_directml_required_session_settings_are_applied(
         runner.session.sess_options.execution_mode
         == fake_ort.ExecutionMode.ORT_SEQUENTIAL
     )
+
+
+def test_qnn_plugin_session_selects_npu(
+    monkeypatch,
+    fake_ort,
+    model_file: Path,
+) -> None:
+    npu_type = type("DeviceType", (), {"name": "NPU"})()
+    ep_device = type(
+        "EpDevice",
+        (),
+        {
+            "ep_name": "QNNExecutionProvider",
+            "device": type("Device", (), {"type": npu_type})(),
+        },
+    )()
+    fake_ort.get_available_providers = lambda: ["CPUExecutionProvider"]
+    fake_ort.get_ep_devices = lambda: [ep_device]
+    fake_ort.SessionOptions.add_provider_for_devices = (
+        lambda self, devices, options: setattr(
+            self,
+            "plugin_provider",
+            (devices, options),
+        )
+    )
+    plugin = type(
+        "QnnPlugin",
+        (),
+        {
+            "get_qnn_htp_path": lambda self: "QnnHtp.dll",
+            "get_qnn_gpu_path": lambda self: "QnnGpu.dll",
+            "get_qnn_cpu_path": lambda self: "QnnCpu.dll",
+        },
+    )()
+
+    monkeypatch.setattr(model, "_load_onnxruntime", lambda: fake_ort)
+    monkeypatch.setattr(model, "_register_qnn_plugin", lambda runtime: plugin)
+
+    runner = model.NPUModel(
+        model_file,
+        provider="QNNExecutionProvider",
+        allow_cpu_fallback=False,
+    )
+
+    _, options = runner.session.sess_options.plugin_provider
+    assert options == {"backend_path": "QnnHtp.dll"}

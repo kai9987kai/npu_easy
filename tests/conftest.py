@@ -30,12 +30,15 @@ class FakeSession:
         model_path: Any,
         *,
         sess_options: FakeSessionOptions,
-        providers: list[str],
-        provider_options: list[dict[str, str]],
+        providers: list[str] | None = None,
+        provider_options: list[dict[str, str]] | None = None,
     ) -> None:
         del model_path
         self.sess_options = sess_options
-        self.provider_options = provider_options
+        self.provider_options = provider_options or []
+        if providers is None and hasattr(sess_options, "plugin_provider"):
+            providers = ["QNNExecutionProvider", "CPUExecutionProvider"]
+        providers = providers or ["CPUExecutionProvider"]
         if providers[0] == "BrokenExecutionProvider":
             raise RuntimeError("provider initialization failed")
         self.providers = providers

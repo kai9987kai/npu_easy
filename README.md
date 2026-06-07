@@ -170,6 +170,8 @@ for unavailable or unsupported accelerators are exposed by
 
 - OpenVINO uses `device_type="NPU"` by default.
 - QNN uses `backend_type="htp"` by default.
+- Standalone `onnxruntime-qnn` 2.x plugins are registered automatically and
+  matched to their reported NPU, GPU, or CPU device.
 - TensorRT uses CUDA as its accelerator fallback when both are installed.
 - DirectML is a broad Windows GPU provider. New Windows deployment work may
   also consider Windows ML, while DirectML remains supported by ONNX Runtime.

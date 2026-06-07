@@ -5,4 +5,5 @@ __pycache__/
 .ruff_cache/
 build/
 dist/
-
+models/
+_qnn.log

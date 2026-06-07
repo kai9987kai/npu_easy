@@ -12,6 +12,9 @@ from typing import Any
 
 from .utils import (
     ProviderConfig,
+    _device_type_name,
+    _get_available_provider_names,
+    _register_qnn_plugin,
     get_available_provider_configs,
     get_provider_config,
 )
@@ -73,6 +76,7 @@ class NPUModel:
         self.fallback_reason: str | None = None
         self.attempted_providers: list[str] = []
         self._ort = _load_onnxruntime()
+        self._qnn_plugin = _register_qnn_plugin(self._ort)
         self._session_options_settings = {
             "intra_op_num_threads": intra_op_num_threads,
             "inter_op_num_threads": inter_op_num_threads,
@@ -117,7 +121,7 @@ class NPUModel:
     ) -> list[ProviderConfig]:
         if provider is None:
             candidates = get_available_provider_configs(
-                self._ort.get_available_providers()
+                _get_available_provider_names(self._ort)
             )
             if provider_options is not None and candidates:
                 first = candidates[0]
@@ -221,6 +225,25 @@ class NPUModel:
                 continue
 
             self.attempted_providers.append(candidate.name)
+            if (
+                candidate.name == "QNNExecutionProvider"
+                and self._qnn_plugin is not None
+                and candidate.name not in self._ort.get_available_providers()
+            ):
+                try:
+                    session = self._initialize_qnn_plugin_session(candidate)
+                except Exception as exc:
+                    failures.append(f"{candidate.label}: {exc}")
+                    logger.debug(
+                        "Failed to initialize %s",
+                        candidate.label,
+                        exc_info=True,
+                    )
+                    continue
+                if failures:
+                    self.fallback_reason = "; ".join(failures)
+                return session, candidate
+
             providers = [candidate.name]
             provider_options = [dict(candidate.options)]
             available = set(self._ort.get_available_providers())
@@ -275,6 +298,35 @@ class NPUModel:
         detail = "; ".join(failures) or "No providers were available."
         raise ProviderInitializationError(
             f"Could not initialize an ONNX Runtime session. {detail}"
+        )
+
+    def _initialize_qnn_plugin_session(self, candidate: ProviderConfig) -> Any:
+        selected_devices = [
+            device
+            for device in self._ort.get_ep_devices()
+            if device.ep_name == candidate.name
+            and _device_type_name(device) == candidate.device
+        ]
+        if not selected_devices:
+            raise ProviderInitializationError(
+                f"No QNN {candidate.device} device was registered."
+            )
+
+        options = dict(candidate.options)
+        backend_type = options.pop("backend_type", None)
+        if "backend_path" not in options:
+            if candidate.device == "NPU" or backend_type == "htp":
+                options["backend_path"] = self._qnn_plugin.get_qnn_htp_path()
+            elif candidate.device == "GPU" or backend_type == "gpu":
+                options["backend_path"] = self._qnn_plugin.get_qnn_gpu_path()
+            else:
+                options["backend_path"] = self._qnn_plugin.get_qnn_cpu_path()
+
+        session_options = self._create_session_options(candidate)
+        session_options.add_provider_for_devices(selected_devices, options)
+        return self._ort.InferenceSession(
+            self.model_path,
+            sess_options=session_options,
         )
 
     def _prepare_input(self, input_data: Any) -> dict[str, Any]:
@@ -398,7 +450,7 @@ class NPUModel:
             "outputs": self.output_names,
             "input_metadata": self.input_metadata,
             "output_metadata": self.output_metadata,
-            "available_providers": list(self._ort.get_available_providers()),
+            "available_providers": _get_available_provider_names(self._ort),
             "onnxruntime_version": getattr(self._ort, "__version__", "unknown"),
         }
 
